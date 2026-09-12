@@ -81,11 +81,40 @@ const clientOptions = {
   define: { 'process.env.NODE_ENV': '"production"' },
 }
 
-/** Wrap the CJS body in the contract the GUI's __ModuleLoader__ expects. */
+/**
+ * Wrap the CJS body in the contract the GUI's __ModuleLoader__ expects.
+ *
+ * Two things the loader requires and esbuild does not supply:
+ *
+ * 1. `module`/`exports` in the factory scope. esbuild's CJS output opens with
+ *    `module.exports = __toCommonJS(...)`, assuming a CommonJS host; the
+ *    ModuleLoader factory is not one, so without these declarations the factory
+ *    throws `ReferenceError: module is not defined` and the client plugin fails
+ *    to mount — which takes the whole GUI down with it.
+ * 2. `return module.exports`. The loader reads the plugin from the factory's
+ *    return value, not from a side effect on a module object it never sees.
+ *
+ * Every published client bundle in this ecosystem does both; this wrapper now
+ * matches, and scripts/check-client-contract.mjs proves it by actually calling
+ * the factory the way the loader does.
+ */
 function wrapClient() {
   const body = readFileSync(clientOut, 'utf8').replace(/^\/\/# sourceMappingURL=.*$/m, '')
   const indented = body.split('\n').map((line) => (line === '' ? '' : `\t\t${line}`)).join('\n')
-  writeFileSync(clientOut, `window.__ModuleLoader__.load({\n\tid: ${JSON.stringify(packageName)},\n\tfactory: (require) => {\n${indented}\n\t}\n});\n`, 'utf8')
+  writeFileSync(
+    clientOut,
+    `window.__ModuleLoader__.load({\n`
+    + `\tid: ${JSON.stringify(packageName)},\n`
+    + `\tfactory: (require) => {\n`
+    + `\t\tvar module = { exports: {} };\n`
+    + `\t\tvar exports = module.exports;\n`
+    + `\t\tObject.defineProperty(exports, Symbol.toStringTag, { value: "Module" });\n`
+    + `${indented}\n`
+    + `\t\treturn module.exports;\n`
+    + `\t}\n`
+    + `});\n`,
+    'utf8',
+  )
 }
 
 /** The panel stylesheet, injected once by the client bundle at apply time. */
@@ -99,6 +128,36 @@ function writeStyleModule() {
   return text.length
 }
 
+/**
+ * Guard the artifact the tests cannot see.
+ *
+ * Every test imports src/ directly, so nothing in the suite exercises the
+ * packaged bundle. A wrapper that forgets `return module.exports` therefore
+ * builds green and then fails to mount in the GUI — taking the shell down with
+ * it. These checks fail the build instead.
+ */
+function assertClientContract() {
+  const text = readFileSync(clientOut, 'utf8')
+  if (!text.startsWith('window.__ModuleLoader__.load(')) {
+    throw new Error('client bundle does not start with the ModuleLoader envelope')
+  }
+  if (!text.includes(`id: ${JSON.stringify(packageName)}`)) {
+    throw new Error(`client bundle id does not match the package name ${packageName}`)
+  }
+  if (!text.includes('return module.exports;')) {
+    throw new Error('client factory does not return module.exports; the loader cannot discover apply/inject')
+  }
+  // esbuild assigns the exports through __export getters, so match the emitted
+  // shape rather than a literal `exports.apply`; the runtime check in
+  // scripts/check-client-contract.mjs proves the names actually resolve.
+  if (!/apply:\s*\(\)\s*=>\s*apply/u.test(text)) {
+    throw new Error('client bundle does not export apply')
+  }
+  if (!/inject:\s*\(\)\s*=>\s*inject/u.test(text)) {
+    throw new Error('client bundle does not export inject')
+  }
+}
+
 if (watch) {
   const hostCtx = await context(hostOptions)
   const clientCtx = await context({
@@ -109,6 +168,7 @@ if (watch) {
         pluginBuild.onEnd((result) => {
           if (result.errors.length > 0) return
           wrapClient()
+          assertClientContract()
           const bytes = writeStyleModule()
           console.log(`[watch] rebuilt ${packageName} (${bytes} bytes of CSS inlined)`)
         })
@@ -122,6 +182,7 @@ if (watch) {
   await build(hostOptions)
   await build(clientOptions)
   wrapClient()
+  assertClientContract()
   const bytes = writeStyleModule()
   console.log(`built ${packageName}: lib/index.js, lib/client.js (${bytes} bytes of CSS inlined)`)
 }

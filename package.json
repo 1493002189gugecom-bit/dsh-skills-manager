@@ -31,7 +31,7 @@
     "url": "git+https://github.com/1493002189gugecom-bit/dsh-skills-manager.git"
   },
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "build": "node scripts/build.mjs && node scripts/check-client-contract.mjs",
     "watch": "node scripts/build.mjs --watch",
     "test": "vitest run",
     "test:watch": "vitest",
