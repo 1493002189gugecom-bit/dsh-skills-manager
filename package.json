@@ -37,6 +37,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "check": "node --check scripts/build.mjs",
+    "prepare": "npm run build",
     "prepack": "npm run build"
   },
   "dsh": {

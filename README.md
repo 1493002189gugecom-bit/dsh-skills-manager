@@ -60,6 +60,30 @@ dsh plugin --profile web add git+https://github.com/1493002189gugecom-bit/dsh-sk
 not touch the other. Fully quit and restart that DSH afterwards (on Desktop,
 quit the tray too).
 
+### pnpm blocks the install build (expected)
+
+The plugin builds `lib/` from source on install via its `prepare` script. pnpm 11
+refuses to run build scripts for git dependencies until that exact spec is
+allowlisted, so the first attempt stops with:
+
+```
+ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED
+The git-hosted package "dsh-skills-manager@<version>" needs to execute build
+scripts but is not in the "allowBuilds" allowlist.
+```
+
+pnpm prints the exact key to use. Add it under `allowBuilds` in
+`$DSH_HOME/profiles/<profile>/pnpm-workspace.yaml`:
+
+```yaml
+allowBuilds:
+  'dsh-skills-manager@git+ssh://git@github.com/1493002189gugecom-bit/dsh-skills-manager.git#<commit>': true
+```
+
+The key is pinned to the resolved commit, so **re-pinning to a newer commit means
+updating this line too** — after a `remove` + `add`, pnpm prints the new key if
+the old one no longer matches.
+
 If you have the original `@linxin666/dsh-client-ui-skill-explorer` enabled in the
 same profile, disable it first — the two panels do the same job and both inject a
 sidebar entry.
