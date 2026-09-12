@@ -1,0 +1,6 @@
+# Bundle patch for this profile layer: inserts the plugin row into the profile
+# roster when the package is installed as a bundle. Install with
+#   dsh plugin --profile desktop add git+https://github.com/1493002189gugecom-bit/dsh-skills-manager.git
+- insert:
+    - id: dsh-skills-manager
+      name: dsh-skills-manager

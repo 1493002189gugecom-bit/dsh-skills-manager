@@ -1,0 +1,411 @@
+// ---------------------------------------------------------------------------
+// Vendored from @linxin666/dsh-client-ui-skill-explorer@0.3.20 (BSD-3-Clause),
+// https://github.com/zhu1090093659/dsh-web — packages/dsh-skill-explorer.
+// Local changes for this fork: API namespace /api/dsh-skills-manager/*, plugin id
+// "dsh-skills-manager", telemetry removed. See README.md for the full change list.
+// ---------------------------------------------------------------------------
+/**
+ * Skill collection: filesystem scanning (primary) plus registry supplement.
+ *
+ * The web profile mounts the skill-filesystem provider only at the agent
+ * preset scope layer, so the host plane cannot read project/user skills from
+ * ctx.skills — the list route scans the official root conventions itself and
+ * merges registry entries (bundled / runtime) by name.
+ */
+
+import { existsSync } from 'node:fs'
+import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, join, sep } from 'node:path'
+import { parseFrontmatter } from './frontmatter.ts'
+import { normalizeKey, type SkillDirectory } from './directories.ts'
+
+/** Display order and copy for each source level. */
+export interface SourceGroup {
+  key: string
+  title: string
+  hint: string
+}
+
+/** Source levels produced by filesystem scanning (registry sources map to the same set). */
+export const SOURCE_GROUPS: SourceGroup[] = [
+  { key: 'bundled', title: 'System bundled', hint: 'Global skills shipped with DSH and its plugins' },
+  { key: 'project-dsh', title: 'Project skills (.dsh/skills)', hint: 'Located in the project directory, scoped to its workspace' },
+  { key: 'project-agents', title: 'Project skills (.agents/skills)', hint: 'Located in the project directory, scoped to its workspace' },
+  { key: 'custom', title: 'Custom directories', hint: 'customSkillDirs config' },
+  { key: 'custom-added', title: 'Directories added in the panel', hint: 'Scan roots added from the skill center' },
+  { key: 'user-dsh', title: 'User skills (~/.dsh/skills)', hint: 'Global skills shared by all projects on this machine' },
+  { key: 'user-agents', title: 'User skills (~/.agents/skills)', hint: 'Global skills shared by all projects on this machine' },
+  { key: 'runtime', title: 'Runtime registered', hint: 'Skills registered at runtime by plugins' },
+]
+
+/** Registry source -> display level mapping (unlisted sources fall into "other"). */
+export const REGISTRY_SOURCE_LEVEL: ReadonlyMap<string, string> = new Map(SOURCE_GROUPS.map((group) => [group.key, group.key]))
+
+/**
+ * Filesystem precedence across roots, matching the official rank order
+ * (project wins over custom wins over user). Parallel scans finish in
+ * arbitrary order, so the winner must be decided by priority comparison,
+ * never by whichever readdir happened to resolve last.
+ */
+const LEVEL_PRIORITY: ReadonlyMap<string, number> = new Map([
+  ['project-dsh', 0],
+  ['project-agents', 1],
+  ['custom', 2],
+  // Panel-added roots share the custom rank: they are the same kind of root,
+  // just a different provenance, so neither may silently outrank the other.
+  ['custom-added', 2],
+  ['user-dsh', 3],
+  ['user-agents', 4],
+])
+
+/** One skill entry as served to the panel. */
+export interface SkillEntry {
+  name: string
+  description: string
+  whenToUse?: string
+  provider?: string
+  level: string
+  path?: string
+  /** True when the skill was discovered through a symlink entry (deletion is not allowed). */
+  linked?: boolean
+  modelInvocable: boolean
+  userInvocable: boolean
+  /** Project workspace root path this skill belongs to. */
+  workspaceRoot?: string
+  /** Display name of the workspace directory. */
+  workspaceName?: string
+  /** True when the skill belongs to the primary active session workspace. */
+  isActiveWorkspace?: boolean
+}
+
+/** Registry snapshot entry shape (subset of ctx.skills entries). */
+export interface RegistrySkill {
+  name: string
+  description: string
+  whenToUse?: string
+  provider?: string
+  source: string
+  resourceBase?: { kind: string; path?: string }
+  invocation?: { modelInvocable?: boolean; userInvocable?: boolean }
+}
+
+/** Options for collectSkills. */
+export interface CollectOptions {
+  /** Registry snapshot workspace base. */
+  cwd: string
+  /** Project roots to scan (each scans .dsh/skills and .agents/skills). */
+  projectRoots?: string[]
+  /**
+   * Extra custom skill roots. Plain strings are treated as config roots;
+   * a SkillDirectory carries its own provenance so panel-added roots land in
+   * their own group.
+   */
+  customSkillDirs?: Array<string | SkillDirectory>
+  /** User dsh config root (~/.dsh). */
+  dshHome: string
+  /** User agents config root (~/.agents). */
+  agentsHome: string
+  /** ctx.skills registry (snapshot). */
+  registry: { snapshot(options: { cwd: string }): Promise<{ skills: RegistrySkill[]; complete: boolean }> }
+}
+
+/** Result of a collection pass. */
+export interface CollectResult {
+  skills: SkillEntry[]
+  complete: boolean
+  /** Listed-skill count per scan root, keyed by normalizeKey(dir). */
+  rootCounts: Map<string, number>
+}
+
+/** Group payload served by the list route. */
+export interface GroupPayload {
+  key: string
+  title: string
+  hint: string
+  skills: SkillEntry[]
+}
+
+/** Workspace descriptor for multi-workspace isolation. */
+export interface WorkspaceItem {
+  root: string
+  name: string
+  active: boolean
+}
+
+/** List payload served by the list route. */
+export interface ListPayload {
+  cwd: string
+  projectRoots: string[]
+  complete: boolean
+  groups: GroupPayload[]
+  workspaces?: WorkspaceItem[]
+}
+
+/** Find the nearest ancestor directory containing .git (cwd itself when none). */
+export function findProjectRoot(cwd: string): string {
+  let current = cwd
+  for (;;) {
+    if (existsSync(join(current, '.git'))) return current
+    const parent = dirname(current)
+    if (parent === current) return cwd
+    current = parent
+  }
+}
+
+/**
+ * Scan one skill root (one level: <name>/SKILL.md or <name>.md).
+ * Async IO via fs/promises so multiple roots can be scanned in parallel.
+ * @returns how many skills this root contributed (0 when absent/unreadable).
+ */
+async function scanSkillRoot(
+  root: string,
+  level: string,
+  into: Map<string, SkillEntry>,
+  workspaceInfo?: { root: string; name: string; active: boolean },
+): Promise<number> {
+  if (!existsSync(root)) return 0
+  let entries
+  try {
+    entries = await readdir(root, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  let listed = 0
+  for (const entry of entries) {
+    const name = entry.name
+    let file: string
+    let linked = false
+    if (entry.isDirectory()) {
+      file = join(root, name, 'SKILL.md')
+    } else if (entry.isFile() && name.endsWith('.md')) {
+      file = join(root, name)
+    } else if (entry.isSymbolicLink()) {
+      // A symlink's dirent is neither a directory nor a file, so a plain
+      // readdir() skips it and linked-out skills never show up. Follow the
+      // target with stat() (cross-platform: Windows symlink/junction, Linux and
+      // macOS symlink all resolve the same way) to classify it, then resolve
+      // the file path like a real entry — the scan path stays on the link, so
+      // the write route (set-enabled) reaches the linked target via the normal
+      // fs follow semantics. Dangling or unreadable links are skipped.
+      // A linked skill is mount-of-intent content, not created under this root:
+      // it stays listable and toggleable, but deletion is refused (see routes).
+      linked = true
+      let linkedFile: string
+      try {
+        const target = await stat(join(root, name))
+        if (target.isDirectory()) linkedFile = join(root, name, 'SKILL.md')
+        else if (target.isFile() && name.endsWith('.md')) linkedFile = join(root, name)
+        else continue
+      } catch {
+        continue
+      }
+      file = linkedFile
+    } else {
+      continue
+    }
+    if (!existsSync(file)) continue
+    let content: string
+    try {
+      content = await readFile(file, 'utf8')
+    } catch {
+      continue
+    }
+    const parsed = parseFrontmatter(content)
+    const skillName = parsed.name ?? name.replace(/\.md$/, '')
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(skillName)) continue
+    const priority = LEVEL_PRIORITY.get(level) ?? 99
+    const existing = into.get(skillName)
+    if (existing !== undefined) {
+      const existingPriority = LEVEL_PRIORITY.get(existing.level) ?? 99
+      if (existingPriority < priority) continue
+      if (existingPriority === priority && existing.isActiveWorkspace && !workspaceInfo?.active) {
+        continue
+      }
+    }
+    into.set(skillName, {
+      name: skillName,
+      description: parsed.description ?? '(no description)',
+      whenToUse: parsed.whenToUse,
+      provider: 'filesystem',
+      level,
+      path: file,
+      linked,
+      // Official frontmatter invocation policy.
+      modelInvocable: parsed.disableModelInvocation !== true,
+      userInvocable: parsed.userInvocable !== false,
+      workspaceRoot: workspaceInfo?.root,
+      workspaceName: workspaceInfo?.name,
+      isActiveWorkspace: workspaceInfo?.active,
+    })
+    listed += 1
+  }
+  return listed
+}
+
+/** Serialize one registry entry into the panel payload (keeps the source for grouping). */
+function serializeRegistry(skill: RegistrySkill): SkillEntry {
+  return {
+    name: skill.name,
+    description: skill.description,
+    whenToUse: skill.whenToUse,
+    provider: skill.provider,
+    level: REGISTRY_SOURCE_LEVEL.get(skill.source) ?? `other:${skill.source}`,
+    // Registry-only entries (bundled / runtime) have no editable file: the
+    // write routes only trust paths from a fresh filesystem scan, so expose
+    // no path here — otherwise the panel would show toggle/delete controls
+    // that always answer 404.
+    path: undefined,
+    modelInvocable: skill.invocation?.modelInvocable ?? false,
+    userInvocable: skill.invocation?.userInvocable ?? false,
+  }
+}
+
+/** Group by level, ordered by SOURCE_GROUPS then leftovers, sorted by name inside each group. */
+export function buildPayload(skills: SkillEntry[], complete: boolean, cwd: string, projectRoots: string[]): ListPayload {
+  const byLevel = new Map<string, SkillEntry[]>()
+  for (const skill of skills) {
+    const list = byLevel.get(skill.level) ?? []
+    list.push(skill)
+    byLevel.set(skill.level, list)
+  }
+  const known = new Set(SOURCE_GROUPS.map((group) => group.key))
+  const groups: GroupPayload[] = SOURCE_GROUPS.map((group) => ({
+    key: group.key,
+    title: group.title,
+    hint: group.hint,
+    skills: (byLevel.get(group.key) ?? []).sort((a, b) => a.name.localeCompare(b.name)),
+  })).filter((group) => group.skills.length > 0)
+  const leftovers: GroupPayload[] = [...byLevel.entries()]
+    .filter(([key]) => !known.has(key))
+    .map(([key, list]) => ({
+      key,
+      title: key.startsWith('other:') ? `Other (${key.slice(6)})` : `Other (${key})`,
+      hint: '',
+      skills: list.sort((a, b) => a.name.localeCompare(b.name)),
+    }))
+  const activeRoot = findProjectRoot(cwd)
+  const allRoots = new Set<string>(projectRoots.length > 0 ? [activeRoot, ...projectRoots] : [activeRoot])
+  const workspaces: WorkspaceItem[] = [...allRoots].map((root) => ({
+    root,
+    name: basename(root) || root,
+    active: root === activeRoot || root === cwd,
+  }))
+
+  return { cwd, projectRoots, complete, groups: [...groups, ...leftovers], workspaces }
+}
+
+/**
+ * Collect grouped skills: filesystem scanning (primary) + registry supplement.
+ * Filesystem entries win on name conflicts; the registry fills whenToUse and
+ * invocation flags, and contributes bundled/runtime entries of its own.
+ * @param options - collection options.
+ * @returns skills and whether the registry snapshot was complete.
+ */
+export async function collectSkills(options: CollectOptions): Promise<CollectResult> {
+  const { cwd, customSkillDirs, dshHome, agentsHome, registry } = options
+  const byName = new Map<string, SkillEntry>()
+  /** Listed-skill count per scan root (feeds the directory panel). */
+  const rootCounts = new Map<string, number>()
+  const activeProjectRoot = findProjectRoot(cwd)
+  const roots = new Set<string>(options.projectRoots !== undefined && options.projectRoots.length > 0 ? [activeProjectRoot, ...options.projectRoots] : [activeProjectRoot])
+  // Each root scans independently, in parallel (Map writes are atomic under the single thread).
+  // The scan resolves to the number of skills that root contributed, which is
+  // what individual roots report; the project/user roots are not counted here.
+  const scanTasks: Array<Promise<unknown>> = []
+  for (const root of roots) {
+    const isActive = root === activeProjectRoot || root === cwd
+    const wsInfo = {
+      root,
+      name: basename(root) || root,
+      active: isActive,
+    }
+    scanTasks.push(scanSkillRoot(join(root, '.dsh', 'skills'), 'project-dsh', byName, wsInfo))
+    scanTasks.push(scanSkillRoot(join(root, '.agents', 'skills'), 'project-agents', byName, wsInfo))
+  }
+  for (const entry of customSkillDirs ?? []) {
+    if (entry === undefined || entry === null) continue
+    // A plain string is a config root (back-compat); a SkillDirectory keeps its
+    // provenance so panel-added roots group separately from configured ones.
+    const dir = typeof entry === 'string' ? entry : entry.path
+    const level = typeof entry === 'string' || entry.source === 'config' ? 'custom' : 'custom-added'
+    const key = normalizeKey(dir)
+    scanTasks.push(scanSkillRoot(dir, level, byName).then((count) => {
+      rootCounts.set(key, count)
+    }))
+  }
+  scanTasks.push(scanSkillRoot(join(dshHome, 'skills'), 'user-dsh', byName))
+  scanTasks.push(scanSkillRoot(join(agentsHome, 'skills'), 'user-agents', byName))
+  await Promise.all(scanTasks)
+
+  // Registry supplement: same-name skills get whenToUse / invocation flags
+  // filled in; registry-only skills (bundled / runtime) join as-is.
+  // Query the registry for primary cwd and any other active project roots so
+  // project-level providers are captured.
+  const snapshotCwds = new Set<string>([cwd, ...roots])
+  let complete = true
+  for (const snapshotCwd of snapshotCwds) {
+    try {
+      const snapshot = await registry.snapshot({ cwd: snapshotCwd })
+      if (snapshot.complete !== true) complete = false
+      for (const skill of snapshot.skills) {
+        const existing = byName.get(skill.name)
+        const serialized = serializeRegistry(skill)
+        if (existing === undefined) {
+          byName.set(skill.name, serialized)
+        } else {
+          if (serialized.whenToUse !== undefined) existing.whenToUse = serialized.whenToUse
+          if (serialized.provider !== undefined) existing.provider = serialized.provider
+          existing.modelInvocable = serialized.modelInvocable
+          existing.userInvocable = serialized.userInvocable
+        }
+      }
+    } catch {
+      // Registry unavailable: the filesystem result still stands.
+      complete = false
+    }
+  }
+  return { skills: [...byName.values()], complete, rootCounts }
+}
+
+/** Single-quote a YAML scalar (doubling embedded quotes); keeps the frontmatter parseable for values containing colons. */
+function yamlQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`
+}
+
+/** Build the new skill file content (create route). */
+export function buildSkillContent(name: string, description: string, whenToUse: string | undefined, content: string, disabled: boolean): string {
+  const lines = ['---', `name: ${name}`, `description: ${yamlQuote(description.replace(/[\r\n]/gu, ' '))}`]
+  if (typeof whenToUse === 'string' && whenToUse.trim() !== '') lines.push(`whenToUse: ${yamlQuote(whenToUse.replace(/[\r\n]/gu, ' '))}`)
+  if (disabled === true) lines.push('disable-model-invocation: true')
+  lines.push('---', '', content.trim(), '')
+  return lines.join('\n')
+}
+
+/** Create a skill file (mkdir -p + write). Returns the absolute target path. */
+export async function writeSkillFile(baseDir: string, name: string, description: string, whenToUse: string | undefined, content: string): Promise<string> {
+  const targetDir = join(baseDir, name)
+  const target = join(targetDir, 'SKILL.md')
+  if (existsSync(target)) throw new Error(`skill ${name} already exists at ${target}`)
+  await mkdir(targetDir, { recursive: true })
+  await writeFile(target, buildSkillContent(name, description.trim(), whenToUse, content, false), 'utf8')
+  return target
+}
+
+/** Move a skill file into its .trash sibling directory (recoverable delete). */
+export async function trashSkillFile(path: string): Promise<string> {
+  const trashDir = join(dirname(path), '.trash')
+  await mkdir(trashDir, { recursive: true })
+  const trashTarget = join(trashDir, `${Date.now()}-SKILL.md`)
+  await rename(path, trashTarget)
+  return trashTarget
+}
+
+/** User skill root convention. */
+export function userSkillRoot(dshHome: string): string {
+  return join(dshHome, 'skills')
+}
+
+/** Project skill root convention (project root + .dsh/skills). */
+export function projectSkillRoot(projectRoot: string): string {
+  return `${projectRoot}${sep}.dsh${sep}skills`
+}
